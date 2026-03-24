@@ -311,9 +311,8 @@ class RekvizitaiScraper:
                 raise ValueError(f"Cannot parse category URL: {category_url}")
 
         base_path = base_match.group(1)
+        query_string = base_match.group(2) or ""
 
-        # First request uses full URL with query params to set search filters
-        # Subsequent requests use clean URLs (the session cookie preserves the filter)
         all_companies: list[Company] = []
         seen_urls: set[str] = set()
         page = 1
@@ -322,10 +321,7 @@ class RekvizitaiScraper:
             if max_pages and page > max_pages:
                 break
 
-            if page == 1:
-                page_url = category_url
-            else:
-                page_url = f"{base_path}{page}/"
+            page_url = f"{base_path}{page}/{query_string}"
             logger.info("Scraping category page %d: %s", page, page_url)
 
             try:
