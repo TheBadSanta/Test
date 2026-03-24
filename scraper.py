@@ -50,6 +50,7 @@ class Company:
     share_capital: str = ""
     employees: str = ""
     activities: str = ""
+    description: str = ""
     url: str = ""
 
 
@@ -279,6 +280,171 @@ class RekvizitaiScraper:
                 company.manager = line.split(":", 1)[1].strip()
 
     # ------------------------------------------------------------------
+    # Category / vertical listing
+    # ------------------------------------------------------------------
+
+    def scrape_category(
+        self,
+        category_url: str,
+        max_pages: int = 0,
+    ) -> list[Company]:
+        """
+        Scrape all companies from a category listing page.
+
+        Extracts basic info (name, address, categories, description, URL)
+        directly from the listing pages without visiting each company page.
+
+        Args:
+            category_url: Full URL to a category page (page 1).
+            max_pages: Max pages to scrape (0 = all pages).
+
+        Returns:
+            List of Company objects with listing-level data.
+        """
+        # Parse the base URL pattern from the provided URL
+        # e.g. https://rekvizitai.vz.lt/en/companies/transportation/1/?...
+        base_match = re.match(r"(https?://[^?]+/)\d+/(\?.*)?", category_url)
+        if not base_match:
+            # Try without page number
+            base_match = re.match(r"(https?://[^?]+/)(\?.*)?", category_url)
+            if not base_match:
+                raise ValueError(f"Cannot parse category URL: {category_url}")
+
+        base_path = base_match.group(1)
+
+        # First request uses full URL with query params to set search filters
+        # Subsequent requests use clean URLs (the session cookie preserves the filter)
+        all_companies: list[Company] = []
+        seen_urls: set[str] = set()
+        page = 1
+
+        while True:
+            if max_pages and page > max_pages:
+                break
+
+            if page == 1:
+                page_url = category_url
+            else:
+                page_url = f"{base_path}{page}/"
+            logger.info("Scraping category page %d: %s", page, page_url)
+
+            try:
+                soup = self._get(page_url)
+            except requests.HTTPError as e:
+                logger.error("HTTP error on page %d: %s", page, e)
+                break
+
+            companies = self._parse_category_listing(soup)
+            if not companies:
+                logger.info("No companies on page %d, stopping.", page)
+                break
+
+            # Deduplicate (sponsored companies repeat across pages)
+            new_count = 0
+            for c in companies:
+                if c.url not in seen_urls:
+                    seen_urls.add(c.url)
+                    all_companies.append(c)
+                    new_count += 1
+
+            logger.info(
+                "Page %d: %d new companies (total: %d)",
+                page, new_count, len(all_companies),
+            )
+
+            # Check for next page
+            has_next = False
+            for link in soup.select("a.page-link"):
+                href = link.get("href", "")
+                if f"/{page + 1}/" in href or href.endswith(f"/{page + 1}"):
+                    has_next = True
+                    break
+            if not has_next:
+                logger.info("No next page found after page %d.", page)
+                break
+
+            page += 1
+
+        logger.info("Category scrape complete: %d companies total.", len(all_companies))
+        return all_companies
+
+    def _parse_category_listing(self, soup: BeautifulSoup) -> list[Company]:
+        """Parse company entries from a category listing page."""
+        companies = []
+        for div in soup.select("div.company"):
+            title_link = div.select_one("a.company-title")
+            if not title_link:
+                continue
+
+            company = Company()
+            company.name = title_link.get("title", "") or title_link.get_text(strip=True)
+            company.url = urljoin(BASE_URL, title_link.get("href", ""))
+
+            addr_div = div.select_one("div.address")
+            if addr_div:
+                company.address = addr_div.get_text(strip=True).rstrip(".")
+
+            acts_div = div.select_one("div.activities")
+            if acts_div:
+                text = acts_div.get_text(strip=True)
+                # Remove "Categories: " prefix
+                text = re.sub(r"^Categories:\s*", "", text)
+                company.activities = text.rstrip(".")
+
+            desc_div = div.select_one("div.description")
+            if desc_div:
+                company.description = desc_div.get_text(strip=True)
+
+            companies.append(company)
+        return companies
+
+    def scrape_category_with_details(
+        self,
+        category_url: str,
+        output_csv: str,
+        max_pages: int = 0,
+        detail_delay: float = 1.0,
+    ) -> list[Company]:
+        """
+        Scrape a category listing, then fetch full details for each company.
+        Writes incrementally to CSV so progress is not lost.
+
+        Args:
+            category_url: Full URL to a category page (page 1).
+            output_csv: Path to the output CSV file.
+            max_pages: Max listing pages (0 = all).
+            detail_delay: Delay between detail page requests.
+        """
+        # Phase 1: Get all company URLs from listing
+        listing = self.scrape_category(category_url, max_pages=max_pages)
+        urls = [c.url for c in listing]
+        logger.info("Phase 1 complete: %d company URLs collected.", len(urls))
+
+        # Phase 2: Scrape each company detail page, writing incrementally
+        fieldnames = list(asdict(Company()).keys())
+        original_delay = self.delay
+        self.delay = detail_delay
+
+        companies = []
+        with open(output_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+
+            for i, url in enumerate(urls, 1):
+                try:
+                    company = self.get_company(url)
+                    companies.append(company)
+                    writer.writerow(asdict(company))
+                    f.flush()
+                    logger.info("(%d/%d) %s", i, len(urls), company.name)
+                except Exception as e:
+                    logger.error("(%d/%d) Failed %s: %s", i, len(urls), url, e)
+
+        self.delay = original_delay
+        logger.info("Done: %d companies written to %s", len(companies), output_csv)
+        return companies
+
+    # ------------------------------------------------------------------
     # Batch scraping
     # ------------------------------------------------------------------
 
@@ -338,6 +504,8 @@ def main():
     parser.add_argument("--word", default="", help="Keyword search")
     parser.add_argument("--pages", type=int, default=1, help="Max result pages (default: 1)")
     parser.add_argument("--url", default="", help="Scrape a single company URL directly")
+    parser.add_argument("--category", default="", help="Category/vertical URL to scrape all listings")
+    parser.add_argument("--details", action="store_true", help="With --category: also scrape each company detail page")
     parser.add_argument("--delay", type=float, default=DEFAULT_DELAY, help="Delay between requests in seconds")
     parser.add_argument("--output", default="companies", help="Output filename (without extension)")
     parser.add_argument("--format", choices=["csv", "json", "both"], default="both", help="Output format")
@@ -345,13 +513,38 @@ def main():
     args = parser.parse_args()
     scraper = RekvizitaiScraper(delay=args.delay)
 
-    if args.url:
+    if args.category:
+        if args.details:
+            # Full detail scrape (slow but comprehensive)
+            companies = scraper.scrape_category_with_details(
+                args.category,
+                output_csv=f"{args.output}.csv",
+                max_pages=args.pages if args.pages != 1 else 0,
+                detail_delay=args.delay,
+            )
+            if args.format in ("json", "both"):
+                scraper.to_json(companies, f"{args.output}.json")
+        else:
+            # Listing-only scrape (fast)
+            companies = scraper.scrape_category(
+                args.category,
+                max_pages=args.pages if args.pages != 1 else 0,
+            )
+            if args.format in ("csv", "both"):
+                scraper.to_csv(companies, f"{args.output}.csv")
+            if args.format in ("json", "both"):
+                scraper.to_json(companies, f"{args.output}.json")
+    elif args.url:
         # Scrape a single company
         company = scraper.get_company(args.url)
         companies = [company]
+        if args.format in ("csv", "both"):
+            scraper.to_csv(companies, f"{args.output}.csv")
+        if args.format in ("json", "both"):
+            scraper.to_json(companies, f"{args.output}.json")
     else:
         if not any([args.name, args.code, args.vat, args.city, args.word]):
-            parser.error("Provide at least one search parameter (--name, --code, --vat, --city, --word) or --url")
+            parser.error("Provide at least one search parameter (--name, --code, --vat, --city, --word), --url, or --category")
 
         urls = scraper.search(
             name=args.name,
@@ -362,15 +555,14 @@ def main():
             max_pages=args.pages,
         )
         companies = scraper.scrape_companies(urls)
-
-    if args.format in ("csv", "both"):
-        scraper.to_csv(companies, f"{args.output}.csv")
-    if args.format in ("json", "both"):
-        scraper.to_json(companies, f"{args.output}.json")
+        if args.format in ("csv", "both"):
+            scraper.to_csv(companies, f"{args.output}.csv")
+        if args.format in ("json", "both"):
+            scraper.to_json(companies, f"{args.output}.json")
 
     print(f"\nDone! Scraped {len(companies)} companies.")
     for c in companies[:5]:
-        print(f"  - {c.name} ({c.registration_code})")
+        print(f"  - {c.name} ({c.registration_code or c.address})")
     if len(companies) > 5:
         print(f"  ... and {len(companies) - 5} more")
 
