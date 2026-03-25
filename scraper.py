@@ -51,6 +51,9 @@ class Company:
     employees: str = ""
     activities: str = ""
     description: str = ""
+    sales_revenue: str = ""
+    num_vehicles: str = ""
+    main_vehicle_brand: str = ""
     url: str = ""
 
 
@@ -230,12 +233,69 @@ class RekvizitaiScraper:
             if acts:
                 company.activities = "; ".join(acts)
 
+        # Sales revenue from div.info-item
+        for item in soup.select("div.info-item"):
+            name_div = item.select_one("div.name")
+            if name_div and "sales revenue" in name_div.get_text(strip=True).lower():
+                value_div = item.select_one("div.value")
+                if value_div:
+                    # Get text before the <span> extra-info
+                    raw = value_div.get_text(strip=True)
+                    # Extract the monetary value (digits and spaces before €)
+                    match = re.search(r"([\d\s]+)\s*€", raw)
+                    if match:
+                        company.sales_revenue = match.group(1).strip() + " €"
+                break
+
+        # Vehicle count from Transport row
+        for row in soup.select("table tr"):
+            label_td = row.select_one("td.name")
+            if label_td and "transport" in label_td.get_text(strip=True).lower():
+                value_td = row.select_one("td.value")
+                if value_td:
+                    text = value_td.get_text(strip=True)
+                    match = re.search(r"(\d+)\s*cars?", text)
+                    if match:
+                        company.num_vehicles = match.group(1)
+                break
+
+        # Main vehicle brand from transport subpage
+        if company.num_vehicles and company.num_vehicles != "0":
+            self._scrape_vehicle_brand(company, url)
+
         # Fallback: parse the hidden textarea with pre-formatted info
         textarea = soup.select_one("textarea#company-copy")
         if textarea:
             self._enrich_from_textarea(company, textarea.get_text())
 
         return company
+
+    def _scrape_vehicle_brand(self, company: Company, url: str) -> None:
+        """Scrape the transport subpage to find the main vehicle brand."""
+        transport_url = url.rstrip("/") + "/transport/"
+        try:
+            soup = self._get(transport_url)
+            # Find the vehicle table by checking for a header with "Brand"
+            for table in soup.select("table"):
+                header = table.select_one("tr")
+                if not header:
+                    continue
+                header_text = header.get_text(strip=True).lower()
+                if "brand" not in header_text:
+                    continue
+                brands: dict[str, int] = {}
+                for row in table.select("tr")[1:]:
+                    cells = row.select("td")
+                    if cells:
+                        brand = cells[0].get_text(strip=True)
+                        if brand:
+                            brands[brand] = brands.get(brand, 0) + 1
+                if brands:
+                    main = max(brands, key=brands.get)
+                    company.main_vehicle_brand = main
+                break
+        except Exception as e:
+            logger.debug("Could not scrape transport page %s: %s", transport_url, e)
 
     @staticmethod
     def _extract_value(td) -> str:
